@@ -1,0 +1,6 @@
+{
+  "name": "Global Chat Connect",
+  "description": "A real-time global chat application featuring user authentication and instant messaging.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": []
+}

@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // User Validation
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'username', 'email']) &&
+             data.keys().size() <= 6 &&
+             data.uid == request.auth.uid &&
+             data.username is string && data.username.size() >= 3 && data.username.size() <= 20 &&
+             data.username.matches('^[a-zA-Z0-9_]+$') &&
+             data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 50;
+    }
+
+    // Message Validation
+    function isValidMessage(data) {
+      return data.keys().hasAll(['text', 'senderId', 'senderName', 'timestamp', 'channelId']) &&
+             data.keys().size() <= 7 &&
+             data.text is string && data.text.size() > 0 && data.text.size() <= 2000 &&
+             data.senderId == request.auth.uid &&
+             data.senderName is string &&
+             data.channelId is string &&
+             data.timestamp == request.time;
+    }
+
+    // User collection
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'lastSeen']) &&
+                      (incoming().keys().hasAll(['displayName', 'lastSeen']) || isValidUser(incoming()));
+    }
+
+    // Username mapping to ensure uniqueness
+    match /usernames/{username} {
+      allow get: if true; 
+      allow create: if isSignedIn() && incoming().uid == request.auth.uid;
+    }
+
+    // Channels
+    match /channels/{channelId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+
+      match /typing/{userId} {
+        allow read: if isSignedIn();
+        allow write: if isOwner(userId);
+      }
+      
+      match /messages/{messageId} {
+        allow list: if isSignedIn();
+        allow get: if isSignedIn();
+        allow create: if isSignedIn() && isValidMessage(incoming());
+        allow update, delete: if false; // Messages are immutable for now
+      }
+    }
+  }
+}

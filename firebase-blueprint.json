@@ -1,0 +1,50 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Public profile information for a chat user.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "username": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "lastSeen": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "username", "email"]
+    },
+    "Message": {
+      "title": "Chat Message",
+      "description": "A single message in a chat channel.",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "senderPhoto": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "channelId": { "type": "string" }
+      },
+      "required": ["text", "senderId", "senderName", "timestamp", "channelId"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User profiles indexed by their Firebase Auth UIDs."
+    },
+    "usernames/{username}": {
+      "schema": "object",
+      "description": "Lookup table to ensure unique usernames. Maps username to UID."
+    },
+    "channels/{channelId}/typing/{userId}": {
+      "schema": "object",
+      "description": "Real-time typing status and current draft for a user in a channel."
+    },
+    "channels/{channelId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Messages belonging to a specific channel."
+    }
+  }
+}
