@@ -76,6 +76,49 @@ import { JoinRequest } from '../types';
 
 const EMOJIS = ['😀', '😂', '😍', '🤔', '🙌', '🔥', '✨', '👍', '❤️', '🎉', '🚀', '😎', '💡', '💯', '👋', '🤖'];
 
+/**
+ * Compresses an image to stay within Firestore/Auth limits.
+ * Default max dimensions 400x400 with 0.7 quality usually results in ~20-40KB.
+ */
+const compressImage = (base64Str: string, maxWidth = 400, maxHeight = 400, quality = 0.7): Promise<string> => {
+  return new Promise((resolve) => {
+    if (!base64Str.startsWith('data:image')) {
+      resolve(base64Str);
+      return;
+    }
+    const img = new Image();
+    img.src = base64Str;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+
+      if (width > height) {
+        if (width > maxWidth) {
+          height *= maxWidth / width;
+          width = maxWidth;
+        }
+      } else {
+        if (height > maxHeight) {
+          width *= maxHeight / height;
+          height = maxHeight;
+        }
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      } else {
+        resolve(base64Str);
+      }
+    };
+    img.onerror = () => resolve(base64Str);
+  });
+};
+
 const MatrixBackground = ({ color, isDarkMode }: { color: string, isDarkMode: boolean }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -326,6 +369,56 @@ export default function Chat() {
   const [showStats, setShowStats] = useState(false);
   const [userStats, setUserStats] = useState<any[]>([]);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [currentUserProfile, setCurrentUserProfile] = useState<{ photoURL?: string, displayName?: string } | null>(null);
+
+  // Synchronize current user profile from Firestore to bypass Auth 2KB limit for photoURL
+  useEffect(() => {
+    if (!auth.currentUser) {
+      setCurrentUserProfile(null);
+      return;
+    }
+    const userRef = doc(db, 'users', auth.currentUser.uid);
+    const unsubscribe = onSnapshot(userRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setCurrentUserProfile({
+          displayName: data.displayName || auth.currentUser?.displayName || '',
+          photoURL: data.photoURL || auth.currentUser?.photoURL || ''
+        });
+      } else {
+        setCurrentUserProfile({
+          displayName: auth.currentUser?.displayName || '',
+          photoURL: auth.currentUser?.photoURL || ''
+        });
+      }
+    }, (err) => {
+      console.error("Error listening to user profile:", err);
+    });
+    return () => unsubscribe();
+  }, [auth.currentUser]);
+
+  const safeUpdateProfile = async (user: any, data: { photoURL?: string, displayName?: string }) => {
+    try {
+      // Firebase Auth photoURL limit is 2048 characters.
+      // If the URL/Base64 is longer, we skip Auth update and rely on Firestore.
+      if (data.photoURL && data.photoURL.length > 2000) {
+        console.warn("Photo URL too long for Firebase Auth. Storing in Firestore only.");
+        await updateProfile(user, { ...data, photoURL: '' });
+      } else {
+        await updateProfile(user, data);
+      }
+    } catch (err: any) {
+      // Catch "Photo URL too long" even if our 2000 catch somehow missed it
+      if (err.code === 'auth/invalid-profile-attribute' || err.message?.includes('Photo URL too long')) {
+        console.warn("Caught Auth photo limit error. Updating Firestore only.");
+        if (data.displayName) {
+          await updateProfile(user, { displayName: data.displayName });
+        }
+      } else {
+        throw err;
+      }
+    }
+  };
 
   const isAdmin = auth.currentUser?.email === (import.meta as any).env.VITE_ADMIN_EMAIL;
   const longPressTimer = useRef<any>(null);
@@ -423,9 +516,16 @@ export default function Chat() {
     e.preventDefault();
     if (!newPhotoURL.trim() || !auth.currentUser) return;
     try {
-      await updateProfile(auth.currentUser, { photoURL: newPhotoURL });
+      let photoToStore = newPhotoURL;
+      
+      // If it's a base64 string, compress it first
+      if (photoToStore.startsWith('data:image')) {
+        photoToStore = await compressImage(photoToStore);
+      }
+
+      await safeUpdateProfile(auth.currentUser, { photoURL: photoToStore });
       const userRef = doc(db, 'users', auth.currentUser.uid);
-      await setDoc(userRef, { photoURL: newPhotoURL }, { merge: true });
+      await setDoc(userRef, { photoURL: photoToStore }, { merge: true });
       setNewPhotoURL('');
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `users/${auth.currentUser?.uid}`);
@@ -575,11 +675,12 @@ export default function Chat() {
     setSending(true);
 
     try {
+      const currentPhotoURL = currentUserProfile?.photoURL || auth.currentUser.photoURL || '';
       await addDoc(collection(db, 'channels', activeChannel, 'messages'), {
         text,
         senderId: auth.currentUser.uid,
         senderName: auth.currentUser.displayName || 'Anonymous',
-        senderPhoto: auth.currentUser.photoURL || '',
+        senderPhoto: currentPhotoURL,
         timestamp: serverTimestamp(),
         channelId: activeChannel,
         type: 'text',
@@ -712,7 +813,7 @@ export default function Chat() {
         channelName: channels.find(c => c.id === activeChannel)?.name,
         userId: auth.currentUser.uid,
         userName: auth.currentUser.displayName || 'Anonymous',
-        userPhoto: auth.currentUser.photoURL || '',
+        userPhoto: currentUserProfile?.photoURL || auth.currentUser.photoURL || '',
         status: 'pending',
         timestamp: serverTimestamp()
       });
@@ -849,11 +950,14 @@ export default function Chat() {
     const reader = new FileReader();
     reader.readAsDataURL(file);
     reader.onloadend = async () => {
-      const base64Data = reader.result as string;
+      const rawBase64 = reader.result as string;
       try {
-        await updateProfile(auth.currentUser!, { photoURL: base64Data });
+        // Compress image to ensure it fits in Firestore (1MB limit)
+        const compressedBase64 = await compressImage(rawBase64);
+        
+        await safeUpdateProfile(auth.currentUser!, { photoURL: compressedBase64 });
         const userRef = doc(db, 'users', auth.currentUser!.uid);
-        await setDoc(userRef, { photoURL: base64Data }, { merge: true });
+        await setDoc(userRef, { photoURL: compressedBase64 }, { merge: true });
       } catch (err) {
         handleFirestoreError(err, OperationType.WRITE, `users/${auth.currentUser?.uid}`);
       }
@@ -864,7 +968,7 @@ export default function Chat() {
     if (!auth.currentUser) return;
     if (!confirm('Tem certeza que deseja remover sua foto de perfil?')) return;
     try {
-      await updateProfile(auth.currentUser, { photoURL: '' });
+      await safeUpdateProfile(auth.currentUser, { photoURL: '' });
       const userRef = doc(db, 'users', auth.currentUser.uid);
       await setDoc(userRef, { photoURL: '' }, { merge: true });
     } catch (err) {
@@ -1219,19 +1323,19 @@ export default function Chat() {
               <div className={`p-4 border-t transition-colors duration-300 ${(wallpaper || (isHackerMode && hackerBackgroundEnabled)) ? 'bg-transparent border-transparent' : (isHackerMode ? (isDarkMode ? 'bg-black' : 'bg-white') : (isDarkMode ? 'border-white/5 bg-[#181818]' : 'border-black/5 bg-[#f0f0f0]'))}`} style={isHackerMode ? { borderTopColor: `${hackerColor}33` } : {}}>
           <div className={`flex items-center gap-3 ${isSidebarCollapsed ? 'justify-center' : ''}`}>
             <div 
-              onClick={() => auth.currentUser?.photoURL && setFullScreenPhoto(auth.currentUser.photoURL)}
+              onClick={() => (currentUserProfile?.photoURL || auth.currentUser?.photoURL) && setFullScreenPhoto(currentUserProfile?.photoURL || auth.currentUser?.photoURL || null)}
               className={`w-10 h-10 rounded-full flex items-center justify-center border shadow-sm overflow-hidden flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity ${isHackerMode ? (isDarkMode ? 'bg-black' : 'bg-white') : (isDarkMode ? 'bg-black border-white/5' : 'bg-white border-black/5')}`} 
               style={isHackerMode ? { borderColor: `${hackerColor}33` } : {}}
             >
-               {auth.currentUser?.photoURL ? (
-                 <img src={auth.currentUser.photoURL} alt="pfp" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+               {currentUserProfile?.photoURL || auth.currentUser?.photoURL ? (
+                 <img src={currentUserProfile?.photoURL || auth.currentUser?.photoURL} alt="pfp" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                ) : (
                  <UserIcon size={20} style={isHackerMode ? { color: hackerTextColor } : {}} className={isHackerMode ? '' : (isDarkMode ? 'text-white' : 'text-[#1a1a1a]')} />
                )}
             </div>
             {!isSidebarCollapsed && (
               <div className="flex-1 overflow-hidden">
-                <p className={`text-sm font-semibold truncate ${isHackerMode ? '' : (isDarkMode ? 'text-white' : 'text-[#1a1a1a]')}`} style={isHackerMode ? { color: hackerTextColor } : {}}>{auth.currentUser?.displayName}</p>
+                <p className={`text-sm font-semibold truncate ${isHackerMode ? '' : (isDarkMode ? 'text-white' : 'text-[#1a1a1a]')}`} style={isHackerMode ? { color: hackerTextColor } : {}}>{currentUserProfile?.displayName || auth.currentUser?.displayName}</p>
                 <p className={`text-xs truncate ${isHackerMode ? 'opacity-40' : (isDarkMode ? 'text-white/40' : 'text-[#9e9e9e]')}`} style={isHackerMode ? { color: hackerTextColor } : {}}>{auth.currentUser?.email}</p>
               </div>
             )}
@@ -2104,8 +2208,8 @@ export default function Chat() {
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            if (auth.currentUser?.photoURL) {
-                              setExpandedPfp(auth.currentUser.photoURL);
+                            if (currentUserProfile?.photoURL || auth.currentUser?.photoURL) {
+                              setExpandedPfp(currentUserProfile?.photoURL || auth.currentUser?.photoURL || null);
                             }
                           }}
                           className={`w-20 h-20 rounded-full overflow-hidden border-4 transition-all hover:scale-110 active:scale-95 shadow-xl cursor-zoom-in relative group ${isHackerMode ? '' : (isDarkMode ? 'border-white/20' : 'border-white')}`} 
@@ -2114,8 +2218,8 @@ export default function Chat() {
                           <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                             <Search className="text-white" size={24} />
                           </div>
-                          {auth.currentUser?.photoURL ? (
-                            <img src={auth.currentUser.photoURL} alt="pfp" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                          {currentUserProfile?.photoURL || auth.currentUser?.photoURL ? (
+                            <img src={currentUserProfile?.photoURL || auth.currentUser?.photoURL} alt="pfp" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                           ) : (
                             <div className="w-full h-full flex items-center justify-center bg-gray-500/10">
                               <UserIcon size={40} />
@@ -2167,7 +2271,7 @@ export default function Chat() {
                             >
                               <ImageIcon size={20} />
                             </button>
-                            {auth.currentUser?.photoURL && (
+                            {(currentUserProfile?.photoURL || auth.currentUser?.photoURL) && (
                               <button 
                                 type="button"
                                 onClick={handleRemovePhoto}
